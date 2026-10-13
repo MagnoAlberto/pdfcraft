@@ -756,4 +756,18 @@ mod tests {
         assert_eq!(command_modifier_label(&ctx), "⌘");
         crate::i18n::set_current(previous);
     }
+
+    #[test]
+    fn markup_commands_have_shortcuts_and_correct_labels() {
+        let ctx = egui::Context::default();
+        ctx.set_os(OperatingSystem::Windows);
+        assert_eq!(command_shortcut_label(&ctx, "comment.highlight"), "Ctrl+Shift+H");
+        assert_eq!(command_shortcut_label(&ctx, "comment.underline"), "Ctrl+U");
+        assert_eq!(command_shortcut_label(&ctx, "comment.strikeout"), "Ctrl+Shift+X");
+
+        ctx.set_os(OperatingSystem::Mac);
+        assert_eq!(command_shortcut_label(&ctx, "comment.highlight"), "⇧⌘H");
+        assert_eq!(command_shortcut_label(&ctx, "comment.underline"), "⌘U");
+        assert_eq!(command_shortcut_label(&ctx, "comment.strikeout"), "⇧⌘X");
+    }
 }

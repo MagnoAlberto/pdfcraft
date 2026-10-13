@@ -216,6 +216,36 @@ fn shortcuts_run_registered_commands() {
     h.key_press_modifiers(Modifiers::COMMAND | Modifiers::CTRL, Key::H);
     h.run_steps(2);
     assert_eq!(h.state().mode, pdfcraft_ui_egui::Mode::Read);
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::CTRL, Key::H);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, pdfcraft_ui_egui::Mode::AllTools);
+
+    // Markup shortcuts: Ctrl+Shift+H (Highlight), Ctrl+U (Underline), Ctrl+Shift+X (Strikeout)
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::H);
+    h.run_steps(2);
+    assert_eq!(h.state().quick_tool, pdfcraft_ui_egui::QuickTool::Comment(pdfcraft_ui_egui::comments::CommentTool::Highlight));
+
+    h.key_press_modifiers(Modifiers::COMMAND, Key::U);
+    h.run_steps(2);
+    assert_eq!(h.state().quick_tool, pdfcraft_ui_egui::QuickTool::Comment(pdfcraft_ui_egui::comments::CommentTool::Underline));
+
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::X);
+    h.run_steps(2);
+    assert_eq!(h.state().quick_tool, pdfcraft_ui_egui::QuickTool::Comment(pdfcraft_ui_egui::comments::CommentTool::StrikeOut));
+
+    // Tool accelerators: V (Select), U (Highlight)
+    h.key_press(Key::V);
+    h.run_steps(2);
+    assert_eq!(h.state().quick_tool, pdfcraft_ui_egui::QuickTool::Select);
+
+    h.key_press(Key::U);
+    h.run_steps(2);
+    assert_eq!(h.state().quick_tool, pdfcraft_ui_egui::QuickTool::Comment(pdfcraft_ui_egui::comments::CommentTool::Highlight));
+
+    // Ctrl+Shift+U alias for Underline
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::U);
+    h.run_steps(2);
+    assert_eq!(h.state().quick_tool, pdfcraft_ui_egui::QuickTool::Comment(pdfcraft_ui_egui::comments::CommentTool::Underline));
 }
 
 #[test]
