@@ -2282,6 +2282,19 @@ impl PdfCraftApp {
             self.set_full_screen(ctx, false);
         }
         if let Some(i) = self.active {
+            // Atalho F7: Alterna o modo Caret Browsing (Navegação de texto por cursor) e exibe notificação
+            if self.dialog.is_none()
+                && !self.palette_open
+                && !ctx.egui_wants_keyboard_input()
+                && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::F7))
+            {
+                let enabled = self.views[i].toggle_caret_browsing();
+                if enabled {
+                    self.notify_tr("Caret browsing on (F7)");
+                } else {
+                    self.notify_tr("Caret browsing off (F7)");
+                }
+            }
             // Select all belongs to the document or page grid, unless a text field or
             // overlay owns the keyboard. Other canvas shortcuts keep their own handling.
             if self.dialog.is_none()
@@ -2296,6 +2309,16 @@ impl PdfCraftApp {
                 } else {
                     self.views[i].select_all();
                 }
+            }
+            // Suporte para Ctrl+Shift+U como atalho alternativo para Underline (além do Ctrl+U padrão)
+            if self.dialog.is_none()
+                && !self.palette_open
+                && !ctx.egui_wants_keyboard_input()
+                && ctx.input_mut(|input| {
+                    input.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::U))
+                })
+            {
+                self.execute("comment.underline");
             }
             self.tool_keys(i, ctx);
             canvas::shortcuts(&mut self.views[i], ctx);
@@ -2361,6 +2384,9 @@ impl PdfCraftApp {
         if ctx.input(|input| input.key_pressed(Key::H)) {
             self.quick_tool = QuickTool::Hand;
             self.space_hand = None;
+        }
+        if ctx.input(|input| input.key_pressed(Key::U)) {
+            self.execute("comment.highlight");
         }
         if space && self.space_hand.is_none() && self.quick_tool != QuickTool::Hand {
             self.space_hand = Some(self.quick_tool);

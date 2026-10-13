@@ -1061,6 +1061,7 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                     (format!("← / →, {}", pair(PAGE_PREV, PAGE_NEXT)), tl!("Previous / next page").to_string()),
                     (named("V"), tl!("Select (V)").to_string()),
                     (named("H / Space (hold)"), tl!("Hand (H)").to_string()),
+                    (crate::i18n::key_name("F7").to_string(), named("Caret browsing")),
                     (crate::i18n::key_name("Delete").to_string(), tl!("Delete selected pages (Organize)").to_string()),
                     (key(SELECT_ALL), tl!("Select all pages (Organize)").to_string()),
                 ] {

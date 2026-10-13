@@ -240,6 +240,16 @@ enum Span {
     Column { rect: [f32; 4] },
 }
 
+/// Direção de movimentação do cursor de texto no modo Caret Browsing.
+/// Permite navegar pelos caracteres e linhas da mesma forma que um editor de texto convencional.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaretDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 impl Selection {
     fn run(page: usize, anchor: usize, head: usize) -> Self {
         Self { page, span: Span::Run { anchor, head } }
@@ -354,6 +364,13 @@ pub struct DocView {
     pub(crate) text_failed: HashSet<usize>,
     pub find: Option<Find>,
     selection: Option<Selection>,
+    /// Modo de navegação com cursor de texto (Caret Browsing). Quando ativado (ex: via F7),
+    /// as setas do teclado navegam pelos glifos e linhas do documento PDF, e Shift + setas seleciona o texto.
+    pub caret_browsing: bool,
+    /// Posição atual do cursor de texto no formato (página, índice_do_glifo).
+    pub caret: Option<(usize, usize)>,
+    /// Indica se o cursor está posicionado no final visual do glifo (por exemplo, após uma palavra ou fim de linha).
+    pub caret_after: bool,
     /// Clicks in the current run on the text layer: two select a word, three the line, four the page.
     clicks: u32,
     last_press_time: f64,
@@ -612,6 +629,9 @@ impl DocView {
             text_failed: HashSet::new(),
             find: None,
             selection: None,
+            caret_browsing: false,
+            caret: None,
+            caret_after: false,
             clicks: 0,
             last_press_time: 0.0,
             last_press_pos: None,
@@ -715,6 +735,8 @@ impl DocView {
         fresh.grid_zoom = self.grid_zoom;
         // Same document id, so the scroll offset egui keeps for it is still this document's.
         fresh.shown = self.shown;
+        fresh.caret_browsing = self.caret_browsing;
+        fresh.caret_after = self.caret_after;
         fresh.highlight_fields = self.highlight_fields;
         fresh.notice_dismissed = self.notice_dismissed;
         fresh.cover = self.cover;
@@ -887,6 +909,359 @@ impl DocView {
     /// Select text on `page` from glyph `from` to glyph `to` (tests and automation).
     pub fn select_text(&mut self, page: usize, from: usize, to: usize) {
         self.selection = Some(Selection::run(page, from, to));
+    }
+
+    /// Alterna o modo de navegação com cursor (Caret Browsing).
+    /// Quando ativado, posiciona o cursor na seleção existente ou no início da página atual.
+    /// Retorna o novo estado (verdadeiro se ativado, falso se desativado).
+    pub fn toggle_caret_browsing(&mut self) -> bool {
+        self.caret_browsing = !self.caret_browsing;
+        if self.caret_browsing {
+            // Ao ligar o Caret Browsing, aproveitamos a seleção ativa (se houver) para
+            // posicionar o cursor no ponto em que o usuário estava trabalhando.
+            if let Some(sel) = self.selection {
+                let g = match sel.span {
+                    Span::Run { head, .. } => head,
+                    Span::Column { .. } => 0,
+                };
+                self.caret = Some((sel.page, g));
+            } else if self.caret.is_none() {
+                // Se não houver seleção nem cursor prévio, inicia no primeiro glifo da página corrente
+                self.caret = Some((self.current, 0));
+            }
+        }
+        self.caret_browsing
+    }
+
+    /// Move o cursor de texto (caret) na direção especificada.
+    /// - `dir`: Left, Right, Up ou Down.
+    /// - `select`: Quando verdadeiro (Shift pressionado), estende ou inicia a seleção de texto mantendo
+    ///   a âncora fixa, exatamente como num editor de texto. Quando falso, desfaz a seleção e move apenas o cursor.
+    /// - `by_word`: Quando verdadeiro (Ctrl pressionado), pula palavras inteiras em vez de avançar caractere a caractere.
+    pub fn step_caret(&mut self, dir: CaretDirection, select: bool, by_word: bool) {
+        // Determina a posição inicial do cursor:
+        // Usa o cursor atual ou, caso não exista, o ponto final da seleção ativa ou o início da página.
+        let (curr_page, curr_glyph) = match self.caret {
+            Some(pos) => pos,
+            None => match self.selection {
+                Some(sel) => match sel.span {
+                    Span::Run { head, .. } => (sel.page, head),
+                    Span::Column { .. } => (sel.page, 0),
+                },
+                None => (self.current, 0),
+            },
+        };
+
+        // Calcula a nova posição de destino com base na geometria do texto, palavras e linhas da página
+        let target = self.calculate_caret_target(curr_page, curr_glyph, dir, by_word);
+        let (target_page, target_glyph) = target.unwrap_or((curr_page, curr_glyph));
+
+        if select {
+            // Se Shift estiver pressionado, atualizamos a seleção:
+            if target_page == curr_page {
+                // Mantém o 'anchor' (ponto onde a seleção começou) se já havia uma seleção nesta página
+                let anchor = match self.selection {
+                    Some(sel) if sel.page == target_page => match sel.span {
+                        Span::Run { anchor, .. } => anchor,
+                        Span::Column { .. } => curr_glyph,
+                    },
+                    _ => curr_glyph,
+                };
+                self.selection = Some(Selection::run(target_page, anchor, target_glyph));
+            } else {
+                // Quando a navegação ultrapassa os limites da página, inicia a seleção na nova página
+                self.selection = Some(Selection::run(target_page, 0, target_glyph));
+            }
+            self.caret_after = false;
+        } else {
+            // Sem Shift: mover as setas limpa a seleção existente, colapsando para o cursor
+            self.selection = None;
+            // Se estiver navegando por palavra para a direita, o cursor fica no final visual da palavra
+            self.caret_after = by_word && matches!(dir, CaretDirection::Right);
+        }
+
+        // Atualiza a posição registrada do cursor
+        self.caret = Some((target_page, target_glyph));
+
+        // Se o cursor transitou para outra página, sincroniza a visualização para garantir que a página fique visível
+        if target_page != self.current {
+            self.current = target_page;
+            self.goto = Some((target_page, 0.0));
+        }
+    }
+
+    /// Localiza o glifo final da palavra atual ou da próxima palavra para o avanço com Ctrl.
+    /// Retorna o índice do último glifo da palavra (ex: "esse|" retorna o índice do último 'e').
+    fn next_word_end(&self, text: &PageText, curr_glyph: usize) -> Option<usize> {
+        let total = text.glyphs.len();
+        if total == 0 {
+            return None;
+        }
+        let cur = curr_glyph.min(total.saturating_sub(1));
+        let is_blank = |k: usize| text.glyphs.get(k).is_none_or(|g| g.text.trim().is_empty());
+
+        // 1. Se estivermos num glifo não-vazio, verifica se podemos avançar até o final da palavra atual
+        if !is_blank(cur)
+            && let Some((_, last)) = text.word_at(cur)
+            && cur < last
+        {
+            return Some(last);
+        }
+
+        // 2. Se já estamos no final da palavra atual ou num espaço, procura o próximo glifo não-vazio
+        let mut next_idx = cur.saturating_add(1);
+        while next_idx < total && is_blank(next_idx) {
+            next_idx = next_idx.saturating_add(1);
+        }
+
+        if next_idx < total {
+            if let Some((_, last)) = text.word_at(next_idx) { Some(last) } else { Some(next_idx) }
+        } else {
+            // Chegou ao fim do texto desta página
+            Some(total.saturating_sub(1))
+        }
+    }
+
+    /// Localiza o glifo inicial da palavra atual ou da palavra anterior para o recuo com Ctrl.
+    /// Retorna o índice do primeiro glifo da palavra (ex: "|texto" retorna o índice de 't').
+    fn prev_word_start(&self, text: &PageText, curr_glyph: usize) -> Option<usize> {
+        let total = text.glyphs.len();
+        if total == 0 {
+            return None;
+        }
+        let cur = curr_glyph.min(total.saturating_sub(1));
+        let is_blank = |k: usize| text.glyphs.get(k).is_none_or(|g| g.text.trim().is_empty());
+
+        // 1. Se estivermos num glifo não-vazio, verifica se podemos recuar para o início da palavra atual
+        if !is_blank(cur)
+            && let Some((first, _)) = text.word_at(cur)
+            && cur > first
+        {
+            return Some(first);
+        }
+
+        // 2. Se já estamos no início da palavra atual ou num espaço, recua para o glifo não-vazio anterior
+        if cur == 0 {
+            return Some(0);
+        }
+        let mut prev_idx = cur.saturating_sub(1);
+        while prev_idx > 0 && is_blank(prev_idx) {
+            prev_idx = prev_idx.saturating_sub(1);
+        }
+
+        if !is_blank(prev_idx) { if let Some((first, _)) = text.word_at(prev_idx) { Some(first) } else { Some(prev_idx) } } else { Some(0) }
+    }
+
+    /// Calcula a posição de destino (página, glifo) para a navegação do cursor.
+    /// Leva em consideração o fluxo de leitura, palavras (quando `by_word` é verdadeiro),
+    /// quebras de linha e proximidade horizontal (eixo X).
+    fn calculate_caret_target(&self, curr_page: usize, curr_glyph: usize, dir: CaretDirection, by_word: bool) -> Option<(usize, usize)> {
+        let text = self.texts.get(&curr_page)?;
+        if text.glyphs.is_empty() {
+            return match dir {
+                CaretDirection::Right | CaretDirection::Down if curr_page.saturating_add(1) < self.page_count => {
+                    Some((curr_page.saturating_add(1), 0))
+                }
+                CaretDirection::Left | CaretDirection::Up if curr_page > 0 => Some((curr_page.saturating_sub(1), 0)),
+                _ => Some((curr_page, 0)),
+            };
+        }
+
+        let total_glyphs = text.glyphs.len();
+        let clamped_glyph = curr_glyph.min(total_glyphs.saturating_sub(1));
+
+        match dir {
+            CaretDirection::Right => {
+                if by_word {
+                    // Pulo por palavra à direita (Ctrl + Seta Direita): avança até o final da palavra atual ou da próxima
+                    let word_end = self.next_word_end(text, clamped_glyph);
+                    match word_end {
+                        Some(target) if target > clamped_glyph => Some((curr_page, target)),
+                        _ if curr_page.saturating_add(1) < self.page_count => {
+                            // Se já estiver no fim da página atual, pula para a próxima página
+                            let next_page = curr_page.saturating_add(1);
+                            let next_target = self.texts.get(&next_page).and_then(|t| self.next_word_end(t, 0)).unwrap_or(0);
+                            Some((next_page, next_target))
+                        }
+                        _ => Some((curr_page, clamped_glyph)),
+                    }
+                } else {
+                    // Avança um caractere à direita
+                    if clamped_glyph.saturating_add(1) < total_glyphs {
+                        Some((curr_page, clamped_glyph.saturating_add(1)))
+                    } else if curr_page.saturating_add(1) < self.page_count {
+                        // Chegou ao fim da página: passa para o primeiro caractere da próxima página
+                        Some((curr_page.saturating_add(1), 0))
+                    } else {
+                        Some((curr_page, clamped_glyph))
+                    }
+                }
+            }
+            CaretDirection::Left => {
+                if by_word {
+                    // Pulo por palavra à esquerda (Ctrl + Seta Esquerda): recua até o início da palavra atual ou da anterior
+                    let word_start = self.prev_word_start(text, clamped_glyph);
+                    match word_start {
+                        Some(target) if target < clamped_glyph => Some((curr_page, target)),
+                        _ if curr_page > 0 => {
+                            // Se já estiver no início da página atual, recua para a página anterior
+                            let prev_page = curr_page.saturating_sub(1);
+                            let prev_last = self.texts.get(&prev_page).and_then(|t| t.glyphs.len().checked_sub(1)).unwrap_or(0);
+                            let prev_target = self.texts.get(&prev_page).and_then(|t| self.prev_word_start(t, prev_last)).unwrap_or(prev_last);
+                            Some((prev_page, prev_target))
+                        }
+                        _ => Some((curr_page, 0)),
+                    }
+                } else {
+                    // Recua um caractere à esquerda
+                    if clamped_glyph > 0 {
+                        Some((curr_page, clamped_glyph.saturating_sub(1)))
+                    } else if curr_page > 0 {
+                        // Chegou ao início da página: recua para o último glifo da página anterior
+                        let prev_page = curr_page.saturating_sub(1);
+                        let prev_last = self.texts.get(&prev_page).and_then(|t| t.glyphs.len().checked_sub(1)).unwrap_or(0);
+                        Some((prev_page, prev_last))
+                    } else {
+                        Some((curr_page, 0))
+                    }
+                }
+            }
+            CaretDirection::Down => {
+                // Seta para baixo: pula para a linha seguinte buscando a coluna horizontal mais alinhada
+                let current_line = text.line_of.get(clamped_glyph).copied()?;
+                let curr_rect = text.glyphs.get(clamped_glyph)?.rect;
+                let curr_cx = (curr_rect[0] + curr_rect[2]) / 2.0;
+
+                let next_line = current_line.saturating_add(1);
+                let next_glyphs: Vec<usize> = text.line_of.iter().enumerate().filter(|(_, l)| **l == next_line).map(|(idx, _)| idx).collect();
+
+                if !next_glyphs.is_empty() {
+                    // Localiza o glifo da linha abaixo cujo centro X é o mais próximo do cursor atual
+                    let best = next_glyphs
+                        .into_iter()
+                        .min_by(|&a, &b| {
+                            let ax = text.glyphs.get(a).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                            let bx = text.glyphs.get(b).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                            ax.total_cmp(&bx)
+                        })
+                        .unwrap_or(clamped_glyph);
+                    Some((curr_page, best))
+                } else if curr_page.saturating_add(1) < self.page_count {
+                    // Se não houver mais linhas nesta página, pula para a primeira linha da próxima página
+                    let next_page = curr_page.saturating_add(1);
+                    let next_best = self
+                        .texts
+                        .get(&next_page)
+                        .and_then(|t| {
+                            let first_line = t.line_of.first().copied()?;
+                            t.line_of.iter().enumerate().filter(|(_, l)| **l == first_line).map(|(idx, _)| idx).min_by(|&a, &b| {
+                                let ax = t.glyphs.get(a).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                                let bx = t.glyphs.get(b).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                                ax.total_cmp(&bx)
+                            })
+                        })
+                        .unwrap_or(0);
+                    Some((next_page, next_best))
+                } else {
+                    // Última linha da página final: posiciona no final da linha atual
+                    let line_end = text.line_of.iter().rposition(|&l| l == current_line).unwrap_or(clamped_glyph);
+                    Some((curr_page, line_end))
+                }
+            }
+            CaretDirection::Up => {
+                // Seta para cima: pula para a linha anterior buscando a coluna horizontal mais alinhada
+                let current_line = text.line_of.get(clamped_glyph).copied()?;
+                let curr_rect = text.glyphs.get(clamped_glyph)?.rect;
+                let curr_cx = (curr_rect[0] + curr_rect[2]) / 2.0;
+
+                if current_line > 0 {
+                    let prev_line = current_line.saturating_sub(1);
+                    let prev_glyphs: Vec<usize> = text.line_of.iter().enumerate().filter(|(_, l)| **l == prev_line).map(|(idx, _)| idx).collect();
+
+                    if !prev_glyphs.is_empty() {
+                        let best = prev_glyphs
+                            .into_iter()
+                            .min_by(|&a, &b| {
+                                let ax = text.glyphs.get(a).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                                let bx = text.glyphs.get(b).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                                ax.total_cmp(&bx)
+                            })
+                            .unwrap_or(clamped_glyph);
+                        Some((curr_page, best))
+                    } else {
+                        Some((curr_page, clamped_glyph))
+                    }
+                } else if curr_page > 0 {
+                    // Primeira linha da página: pula para a última linha da página anterior
+                    let prev_page = curr_page.saturating_sub(1);
+                    let prev_best = self
+                        .texts
+                        .get(&prev_page)
+                        .and_then(|t| {
+                            let last_line = t.line_of.last().copied()?;
+                            t.line_of.iter().enumerate().filter(|(_, l)| **l == last_line).map(|(idx, _)| idx).min_by(|&a, &b| {
+                                let ax = t.glyphs.get(a).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                                let bx = t.glyphs.get(b).map(|g| ((g.rect[0] + g.rect[2]) / 2.0 - curr_cx).abs()).unwrap_or(f32::MAX);
+                                ax.total_cmp(&bx)
+                            })
+                        })
+                        .unwrap_or(0);
+                    Some((prev_page, prev_best))
+                } else {
+                    // Primeira linha da primeira página: posiciona no início da linha atual
+                    let line_start = text.line_of.iter().position(|&l| l == current_line).unwrap_or(0);
+                    Some((curr_page, line_start))
+                }
+            }
+        }
+    }
+
+    /// Move o cursor para o início (Home) ou fim (End) da linha atual.
+    /// Se `select` for verdadeiro (Shift pressionado), estende a seleção até esse limite da linha.
+    pub fn step_caret_line_boundary(&mut self, forward: bool, select: bool) {
+        let (curr_page, curr_glyph) = match self.caret {
+            Some(pos) => pos,
+            None => match self.selection {
+                Some(sel) => match sel.span {
+                    Span::Run { head, .. } => (sel.page, head),
+                    Span::Column { .. } => (sel.page, 0),
+                },
+                None => (self.current, 0),
+            },
+        };
+
+        let target_glyph = if let Some(text) = self.texts.get(&curr_page) {
+            if let Some(&line) = text.line_of.get(curr_glyph) {
+                if forward {
+                    // Final da linha (End)
+                    text.line_of.iter().rposition(|&l| l == line).unwrap_or(curr_glyph)
+                } else {
+                    // Início da linha (Home)
+                    text.line_of.iter().position(|&l| l == line).unwrap_or(curr_glyph)
+                }
+            } else {
+                curr_glyph
+            }
+        } else {
+            curr_glyph
+        };
+
+        if select {
+            let anchor = match self.selection {
+                Some(sel) if sel.page == curr_page => match sel.span {
+                    Span::Run { anchor, .. } => anchor,
+                    Span::Column { .. } => curr_glyph,
+                },
+                _ => curr_glyph,
+            };
+            self.selection = Some(Selection::run(curr_page, anchor, target_glyph));
+            self.caret_after = false;
+        } else {
+            self.selection = None;
+            self.caret_after = forward;
+        }
+
+        self.caret = Some((curr_page, target_glyph));
     }
 
     /// Open the find bar (or focus it if already open).
@@ -1977,48 +2352,73 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context) {
             view.find = None;
         }
     }
-    if key(Key::Home) {
-        view.go_to_page(0);
+    // F7: Atalho para alternar o modo Caret Browsing (Navegação com cursor no texto)
+    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F7)) {
+        view.toggle_caret_browsing();
     }
-    if key(Key::End) {
-        view.go_to_page(usize::MAX);
-    }
-    // As in Acrobat: → / ← go to the next / previous page in every layout (#185), and so do
-    // ⌘Page Down / ⌘Page Up, or plain Page Down / Page Up in single-page view.
-    let command = ctx.input(|i| i.modifiers.command);
-    let scrolls = view.continuous;
-    if key(Key::ArrowRight) || (key(Key::PageDown) && (command || !scrolls)) {
-        view.step_page(true);
-    }
-    if key(Key::ArrowLeft) || (key(Key::PageUp) && (command || !scrolls)) {
-        view.step_page(false);
-    }
-    // ↓ / ↑ scroll a line, and Page Down / Page Up a screen where the pages scroll. In
-    // single-page view, ↓ / ↑ turn the page once there is nothing left to scroll that way, as
-    // the wheel does (#273): always on a page that fits.
-    if !command {
-        let screen = (view.viewport_h - KEY_SCROLL_LINE).max(KEY_SCROLL_LINE);
-        let steps = [(Key::ArrowDown, KEY_SCROLL_LINE), (Key::ArrowUp, -KEY_SCROLL_LINE), (Key::PageDown, screen), (Key::PageUp, -screen)];
-        for (k, by) in steps {
-            let arrow = matches!(k, Key::ArrowDown | Key::ArrowUp);
-            if !key(k) || !(scrolls || arrow) {
-                continue;
-            }
-            let forward = k == Key::ArrowDown;
-            // Only an up-to-date view counts: the page drawn is the current one, with no jump pending.
-            let at_end = !scrolls
-                && view.goto.is_none()
-                && view.single_edges.is_some_and(|(page, top, bottom)| page == view.current && if forward { bottom } else { top });
-            if at_end {
-                let before = view.current;
-                view.step_page(forward);
-                if !forward && view.current != before {
-                    // Going back up lands on the bottom of the previous page.
-                    view.goto = Some((view.current, 1.0));
+    if view.caret_browsing {
+        // Quando o Caret Browsing está ativo, as setas do teclado controlam o cursor de texto
+        // e a tecla Shift permite selecionar trechos de texto como em qualquer editor convencional.
+        // A combinação com Ctrl pula palavras inteiras em vez de caracteres individuais.
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let ctrl = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        if key(Key::ArrowRight) {
+            view.step_caret(CaretDirection::Right, shift, ctrl);
+        } else if key(Key::ArrowLeft) {
+            view.step_caret(CaretDirection::Left, shift, ctrl);
+        } else if key(Key::ArrowDown) {
+            view.step_caret(CaretDirection::Down, shift, ctrl);
+        } else if key(Key::ArrowUp) {
+            view.step_caret(CaretDirection::Up, shift, ctrl);
+        } else if key(Key::Home) {
+            view.step_caret_line_boundary(false, shift);
+        } else if key(Key::End) {
+            view.step_caret_line_boundary(true, shift);
+        }
+    } else {
+        if key(Key::Home) {
+            view.go_to_page(0);
+        }
+        if key(Key::End) {
+            view.go_to_page(usize::MAX);
+        }
+        // As in Acrobat: → / ← go to the next / previous page in every layout (#185), and so do
+        // ⌘Page Down / ⌘Page Up, or plain Page Down / Page Up in single-page view.
+        let command = ctx.input(|i| i.modifiers.command);
+        let scrolls = view.continuous;
+        if key(Key::ArrowRight) || (key(Key::PageDown) && (command || !scrolls)) {
+            view.step_page(true);
+        }
+        if key(Key::ArrowLeft) || (key(Key::PageUp) && (command || !scrolls)) {
+            view.step_page(false);
+        }
+        // ↓ / ↑ scroll a line, and Page Down / Page Up a screen where the pages scroll. In
+        // single-page view, ↓ / ↑ turn the page once there is nothing left to scroll that way, as
+        // the wheel does (#273): always on a page that fits.
+        if !command {
+            let screen = (view.viewport_h - KEY_SCROLL_LINE).max(KEY_SCROLL_LINE);
+            let steps = [(Key::ArrowDown, KEY_SCROLL_LINE), (Key::ArrowUp, -KEY_SCROLL_LINE), (Key::PageDown, screen), (Key::PageUp, -screen)];
+            for (k, by) in steps {
+                let arrow = matches!(k, Key::ArrowDown | Key::ArrowUp);
+                if !key(k) || !(scrolls || arrow) {
+                    continue;
                 }
-                view.single_edges = None;
-            } else {
-                view.key_scroll += by;
+                let forward = k == Key::ArrowDown;
+                // Only an up-to-date view counts: the page drawn is the current one, with no jump pending.
+                let at_end = !scrolls
+                    && view.goto.is_none()
+                    && view.single_edges.is_some_and(|(page, top, bottom)| page == view.current && if forward { bottom } else { top });
+                if at_end {
+                    let before = view.current;
+                    view.step_page(forward);
+                    if !forward && view.current != before {
+                        // Going back up lands on the bottom of the previous page.
+                        view.goto = Some((view.current, 1.0));
+                    }
+                    view.single_edges = None;
+                } else {
+                    view.key_scroll += by;
+                }
             }
         }
     }
@@ -2748,6 +3148,35 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                         painter.rect_stroke(to_screen(rect), CornerRadius::ZERO, outline, egui::StrokeKind::Middle);
                     }
                 }
+                // Cursor de texto piscante para Caret Browsing (navegação por teclado)
+                // Quando o modo está ativo nesta página, desenha uma linha vertical suavemente piscante
+                if view.caret_browsing
+                    && let Some((caret_page, caret_glyph)) = view.caret
+                    && caret_page == i
+                    && let Some(g) = text.glyphs.get(caret_glyph)
+                {
+                    let screen_rect = to_screen(g.rect);
+                    // Determina se o cursor deve ser desenhado à direita (final) ou à esquerda (início) do glifo.
+                    // Quando há seleção avançando para a frente (head >= anchor) ou navegação terminada no fim da palavra (caret_after),
+                    // desenha no lado direito (screen_rect.max.x).
+                    let at_end = match view.selection {
+                        Some(sel) if sel.page == i => match sel.span {
+                            Span::Run { anchor, head } => head >= anchor,
+                            Span::Column { .. } => false,
+                        },
+                        _ => view.caret_after,
+                    };
+                    let caret_x = if at_end { screen_rect.max.x } else { screen_rect.min.x };
+                    // Efeito suave de piscar do cursor (500 ms ligado / 500 ms desligado)
+                    let time = ui.input(|inp| inp.time);
+                    let blink = (time * 2.0).fract() < 0.5;
+                    if blink {
+                        let caret_rect = Rect::from_min_max(pos2(caret_x - 1.0, screen_rect.min.y), pos2(caret_x + 1.0, screen_rect.max.y));
+                        painter.rect_filled(caret_rect, CornerRadius::ZERO, t.accent);
+                    }
+                    // Mantém a interface redesenhando periodicamente para a animação do cursor
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                }
                 if selects_text
                     && !consumed
                     && let Some(p) = pointer.filter(|p| r.contains(*p))
@@ -2806,6 +3235,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                             Span::Run { head, .. } => {
                                 if let Some(h) = text.nearest(vx, vy) {
                                     *head = h;
+                                    view.caret = Some((i, h));
+                                    view.caret_after = false;
                                 }
                             }
                             Span::Column { rect } => {
@@ -2845,6 +3276,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                             });
                             if let Some((first, last)) = span {
                                 view.selection = Some(Selection::run(i, first, last));
+                                view.caret = Some((i, last));
+                                view.caret_after = true;
                             }
                         }
                     } else if resp.clicked() && view.clicks < 2 && !over_link {
@@ -2854,8 +3287,18 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                         // span pages) a click clears the selection.
                         let shift = ui.input(|inp| inp.modifiers.shift);
                         match (view.selection.as_mut().filter(|s| shift && s.page == i).map(|s| &mut s.span), text.nearest(vx, vy)) {
-                            (Some(Span::Run { head, .. }), Some(h)) => *head = h,
-                            _ => view.selection = None,
+                            (Some(Span::Run { head, .. }), Some(h)) => {
+                                *head = h;
+                                view.caret = Some((i, h));
+                                view.caret_after = false;
+                            }
+                            _ => {
+                                view.selection = None;
+                                if let Some(h) = text.nearest(vx, vy) {
+                                    view.caret = Some((i, h));
+                                    view.caret_after = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -5284,5 +5727,160 @@ trailer << /Root 1 0 R >>
         assert_eq!(v.find.as_ref().unwrap().current, Some(0));
         assert_eq!(v.find.as_ref().unwrap().matches, vec![(1, 5..9)]);
         assert!(v.goto.is_none());
+    }
+
+    #[test]
+    fn caret_browsing_toggle_and_navigation() {
+        let info = thumbnail_info(2);
+        let mut v = DocView::new(DocId(1), &info, ViewDefaults::default());
+
+        // Cria texto em 2 linhas para teste de navegação
+        // Linha 0: "esse é um texto" (12 glifos divididos em 4 palavras)
+        //   - "esse"  (glifos 0..=3, X de 10 a 50)
+        //   - "é"     (glifo 4, X de 60 a 70, space_before = true)
+        //   - "um"    (glifos 5..=6, X de 80 a 100, space_before em 5 = true)
+        //   - "texto" (glifos 7..=11, X de 110 a 160, space_before em 7 = true)
+        // Linha 1: 5 glifos (12..=16, X de 10 a 60, Y de 30 a 40)
+        let mut glyphs = Vec::new();
+        let mut line_of = Vec::new();
+        let mut space_before = Vec::new();
+
+        let l0_chars = ['e', 's', 's', 'e', 'é', 'u', 'm', 't', 'e', 'x', 't', 'o'];
+        let l0_spaces = [false, false, false, false, true, true, false, true, false, false, false, false];
+
+        for (i, (&ch, &sb)) in l0_chars.iter().zip(l0_spaces.iter()).enumerate() {
+            let x = 10.0 + (i as f32) * 12.0;
+            glyphs.push(pdfcraft_render::TextGlyph {
+                text: ch.to_string(),
+                rect: [x, 10.0, x + 10.0, 20.0],
+                quad: [[x, 10.0], [x + 10.0, 10.0], [x + 10.0, 20.0], [x, 20.0]],
+                direction: [1.0, 0.0],
+            });
+            line_of.push(0);
+            space_before.push(sb);
+        }
+
+        for i in 0..5 {
+            let x = 10.0 + (i as f32) * 12.0;
+            glyphs.push(pdfcraft_render::TextGlyph {
+                text: "b".into(),
+                rect: [x, 30.0, x + 10.0, 40.0],
+                quad: [[x, 30.0], [x + 10.0, 30.0], [x + 10.0, 40.0], [x, 30.0]],
+                direction: [1.0, 0.0],
+            });
+            line_of.push(1);
+            space_before.push(false);
+        }
+
+        let page_text = Arc::new(PageText { glyphs, line_of, space_before });
+        v.texts.insert(0, page_text.clone());
+
+        // 1. Alternância de ativação do Caret Browsing (F7)
+        assert!(!v.caret_browsing);
+        assert!(v.toggle_caret_browsing(), "ativação via F7 retorna true");
+        assert!(v.caret_browsing);
+        assert_eq!(v.caret, Some((0, 0)), "cursor inicializa no primeiro glifo da página corrente");
+
+        // 2. Navegação caractere a caractere (sem Ctrl, sem Shift)
+        v.step_caret(CaretDirection::Right, false, false);
+        assert_eq!(v.caret, Some((0, 1)), "seta para a direita avança um glifo");
+        assert!(v.selection.is_none(), "navegação sem Shift não cria seleção");
+
+        // 3. Seleção de caractere com Shift (sem Ctrl)
+        v.step_caret(CaretDirection::Right, true, false);
+        assert_eq!(v.caret, Some((0, 2)));
+        assert_eq!(v.selection, Some(Selection::run(0, 1, 2)), "Shift + seta cria seleção de glifo 1 a 2");
+
+        // 4. Mover a seta sem Shift desfaz a seleção
+        v.step_caret(CaretDirection::Right, false, false);
+        assert_eq!(v.caret, Some((0, 3)));
+        assert!(v.selection.is_none(), "mover seta sem Shift limpa a seleção");
+
+        // Retorna o cursor para o início da página (0) para testar pulos de palavra
+        v.step_caret_line_boundary(false, false);
+        assert_eq!(v.caret, Some((0, 0)));
+
+        // 5. Pulo entre palavras com Ctrl (sem Shift) - avança sempre para o FINAL de cada palavra
+        // Cursor em 0 ("|esse"): Ctrl + Direita pula para o final de "esse" (glifo 3)
+        v.step_caret(CaretDirection::Right, false, true);
+        assert_eq!(v.caret, Some((0, 3)), "Ctrl + Direita pula para o fim da palavra 'esse'");
+        assert!(v.caret_after, "cursor marcado para renderizar no final visual da palavra");
+
+        // Cursor em 3 ("esse|"): Ctrl + Direita pula para o final da próxima palavra ("é", glifo 4)
+        v.step_caret(CaretDirection::Right, false, true);
+        assert_eq!(v.caret, Some((0, 4)), "Ctrl + Direita pula para o fim de 'é'");
+
+        // Cursor em 4 ("esse é|"): Ctrl + Direita pula para o final de "um" (glifo 6)
+        v.step_caret(CaretDirection::Right, false, true);
+        assert_eq!(v.caret, Some((0, 6)), "Ctrl + Direita pula para o fim de 'um'");
+
+        // Cursor em 6 ("esse é um|"): Ctrl + Direita pula para o final de "texto" (glifo 11)
+        v.step_caret(CaretDirection::Right, false, true);
+        assert_eq!(v.caret, Some((0, 11)), "Ctrl + Direita pula para o fim de 'texto'");
+
+        // 6. Recuo entre palavras com Ctrl (sem Shift) - recua sempre para o INÍCIO de cada palavra
+        // Cursor em 11 ("texto|"): Ctrl + Esquerda recua para o início de "texto" (glifo 7)
+        v.step_caret(CaretDirection::Left, false, true);
+        assert_eq!(v.caret, Some((0, 7)), "Ctrl + Esquerda recua para o início de 'texto'");
+        assert!(!v.caret_after);
+
+        // Cursor em 7 ("|texto"): Ctrl + Esquerda recua para o início de "um" (glifo 5)
+        v.step_caret(CaretDirection::Left, false, true);
+        assert_eq!(v.caret, Some((0, 5)), "Ctrl + Esquerda recua para o início de 'um'");
+
+        // Cursor em 5 ("|um"): Ctrl + Esquerda recua para o início de "é" (glifo 4)
+        v.step_caret(CaretDirection::Left, false, true);
+        assert_eq!(v.caret, Some((0, 4)), "Ctrl + Esquerda recua para o início de 'é'");
+
+        // Cursor em 4 ("|é"): Ctrl + Esquerda recua para o início de "esse" (glifo 0)
+        v.step_caret(CaretDirection::Left, false, true);
+        assert_eq!(v.caret, Some((0, 0)), "Ctrl + Esquerda recua para o início de 'esse'");
+
+        // 7. Seleção de palavras com Ctrl + Shift
+        // Cursor em 0 ("|esse"): Ctrl + Shift + Direita seleciona até o final de "esse" (0..=3)
+        v.step_caret(CaretDirection::Right, true, true);
+        assert_eq!(v.caret, Some((0, 3)));
+        assert_eq!(v.selection, Some(Selection::run(0, 0, 3)), "Ctrl + Shift + Direita seleciona 'esse'");
+
+        // Continua a seleção: Ctrl + Shift + Direita expande até o final de "é" (glifo 4)
+        v.step_caret(CaretDirection::Right, true, true);
+        assert_eq!(v.caret, Some((0, 4)));
+        assert_eq!(v.selection, Some(Selection::run(0, 0, 4)), "Ctrl + Shift + Direita seleciona 'esse é'");
+
+        // Continua a seleção: Ctrl + Shift + Direita expande até o final de "um" (glifo 6)
+        v.step_caret(CaretDirection::Right, true, true);
+        assert_eq!(v.caret, Some((0, 6)));
+        assert_eq!(v.selection, Some(Selection::run(0, 0, 6)), "Ctrl + Shift + Direita seleciona 'esse é um'");
+
+        // Mover com seta sem Shift limpa a seleção
+        v.step_caret(CaretDirection::Right, false, true);
+        assert_eq!(v.caret, Some((0, 11)));
+        assert!(v.selection.is_none(), "mover sem Shift limpa a seleção");
+
+        // 8. Seleção reversa de palavras com Ctrl + Shift para a esquerda
+        // Cursor em 11 ("texto|"): Ctrl + Shift + Esquerda seleciona até o início de "texto" (glifo 7)
+        v.step_caret(CaretDirection::Left, true, true);
+        assert_eq!(v.caret, Some((0, 7)));
+        assert_eq!(v.selection, Some(Selection::run(0, 11, 7)), "Ctrl + Shift + Esquerda seleciona 'texto'");
+
+        // 9. Navegação vertical (Seta para baixo vai para a próxima linha)
+        v.step_caret(CaretDirection::Down, false, false);
+        assert_eq!(v.caret, Some((0, 16)), "seta para baixo pula para o glifo equivalente na linha 1");
+
+        // Seta para cima retorna para a linha 0 (na coluna X mais próxima: glifo 4 tem o mesmo X do glifo 16)
+        v.step_caret(CaretDirection::Up, false, false);
+        assert_eq!(v.caret, Some((0, 4)), "seta para cima retorna para a linha 0 na mesma coluna X");
+
+        // 10. Início e fim de linha (Home e End)
+        v.step_caret_line_boundary(false, false);
+        assert_eq!(v.caret, Some((0, 0)), "Home posiciona no início da linha");
+
+        v.step_caret_line_boundary(true, true);
+        assert_eq!(v.caret, Some((0, 11)), "Shift + End vai para o fim da linha");
+        assert_eq!(v.selection, Some(Selection::run(0, 0, 11)), "Shift + End seleciona a linha inteira");
+
+        // 11. Desativação do modo Caret Browsing
+        assert!(!v.toggle_caret_browsing(), "desativação via F7 retorna false");
+        assert!(!v.caret_browsing);
     }
 }
